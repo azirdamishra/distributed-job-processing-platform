@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────
+# docker-compose.yml — Phase 1: Queue + Workers Foundation
+# ─────────────────────────────────────────────────────────────
+# Compose does three things for you automatically:
+#   1. Creates a shared NETWORK — services find each other by name
+#   2. Manages STARTUP ORDER — via depends_on
+#   3. Handles VOLUME MOUNTS — so data survives container restarts
+# ─────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ── 1. REDIS ──────────────────────────────────────────────
+  # The brain of the system. Holds the job queue, job state,
+  # and results. Every other container depends on this.
+  redis:
+    image: redis:7-alpine          # alpine = minimal image, ~30MB vs ~100MB
+    container_name: redis
+    ports:
+      - "6379:6379"                # expose to host so you can inspect with redis-cli
+    volumes:
+      - redis_data:/data           # jobs/state survive a container restart
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf  # mount our config file
+    command: redis-server /usr/local/etc/redis/redis.conf
+      # without this line Redis ignores the conf entirely —
+      # it defaults to built-in settings, not what we defined in redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s                 # check every 5 seconds
+      timeout: 3s                  # fail if no response in 3s
+      retries: 5                   # mark unhealthy after 5 failures
+    networks:
+      - app_network
+
+  # ── 2. API ────────────────────────────────────────────────
+  # The job producer. Exposes HTTP endpoints so you (or a
+  # load tester later) can submit jobs and check their status.
+  api:
+    build:
+      context: ./api               # look for Dockerfile in ./api
+    container_name: api
+    ports:
+      - "8000:8000"                # FastAPI accessible at localhost:8000
+    environment:
+      - REDIS_HOST=redis           # "redis" resolves because of shared network
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy # wait for Redis healthcheck to pass
+                                   # NOT just "started" — actually ready
+    networks:
+      - app_network
+
+  # ── 3. WORKER ─────────────────────────────────────────────
+  # The job consumer. This is what you will scale horizontally.
+  # Notice: no ports. Workers don't receive traffic, they PULL.
+  # This is the pull model — fundamental to queue-based systems.
+  worker:
+    build:
+      context: ./worker
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # WORKER_ID is set dynamically at runtime so each replica
+      # has a unique identity in logs and Redis state hashes.
+      # Phase 3 autoscaler will inject this automatically.
+      # For now, set manually: WORKER_ID=worker-2 docker-compose up
+      - WORKER_ID=${WORKER_ID:-worker-1}
+    depends_on:
+      redis:
+        condition: service_healthy
+    mem_limit: 512m                # memory ceiling per worker container
+                                   # this is how "900MB of 1024MB" from the image
+                                   # becomes something you can actually observe and tune.
+                                   # deploy.resources only works in Docker Swarm —
+                                   # mem_limit is the plain Compose equivalent
+    networks:
+      - app_network
+    restart: on-failure            # if worker crashes mid-job, Compose restarts it
+                                   # the job retry logic in Redis handles the rest
+    # To run multiple workers locally:
+    #   docker-compose up --scale worker=3
+    # Each gets a unique container name: phase1-worker-1, phase1-worker-2, etc.
+    # Phase 3 will automate this scaling decision entirely.
+
+
+# ── NETWORKS ────────────────────────────────────────────────
+# Compose creates this bridge network automatically.
+# All services on the same network can reach each other by
+# service name. "redis" resolves to Redis's internal IP.
+# Containers NOT on this network cannot reach them — isolation.
+networks:
+  app_network:
+    driver: bridge
+
+
+# ── VOLUMES ─────────────────────────────────────────────────
+# Named volumes are managed by Docker, not tied to a host path.
+# redis_data persists even if you do `docker-compose down`.
+# Only `docker-compose down -v` removes it.
+volumes:
+  redis_data:

@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────────────────────
+# worker/requirements.txt
+# ─────────────────────────────────────────────────────────────
+# Notice what is NOT here: FastAPI, uvicorn, pydantic.
+# The worker is not an HTTP server. It has no endpoints.
+# It pulls from a queue and processes. That's it.
+# Keeping dependencies minimal keeps the container small
+# and the worker's responsibility clear.
+# ─────────────────────────────────────────────────────────────
+
+# redis-py — same as API, but the worker uses it differently.
+# API uses lpush to produce. Worker uses brpop to consume.
+# Same client, opposite direction.
+redis==5.0.4
+
+# httpx — async HTTP client for the load test pipeline.
+# When job_type is load_test, the worker fires HTTP requests
+# at the target URL. httpx is the modern replacement for requests —
+# async-native, connection pooling built in.
+httpx==0.27.0
+
+# pydantic-settings — same Settings pattern as the API.
+# Worker needs REDIS_HOST, REDIS_PORT, WORKER_ID from environment.
+pydantic-settings==2.2.1
