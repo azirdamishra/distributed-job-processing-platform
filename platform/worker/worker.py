@@ -1,17 +1,16 @@
 # ─────────────────────────────────────────────────────────────
-# worker/worker.py — Job Consumer
+# worker/worker.py — Job Consumer (Phase 2)
 # ─────────────────────────────────────────────────────────────
-# Responsibilities:
-#   1. Block on Redis queue waiting for jobs (brpop)
-#   2. Deserialize and route job to correct pipeline
-#   3. Execute the pipeline (load test or video process)
-#   4. Handle failures — retry logic, state transitions
-#   5. Write results back to Redis state hash
+# What changed from Phase 1:
+#   - run_load_test() now captures full percentile distribution,
+#     error bucketing by category, throughput, duration,
+#     and per-worker tagging on the result
 #
-# What this file is NOT responsible for:
-#   - Accepting HTTP traffic (no FastAPI, no uvicorn)
-#   - Knowing how jobs were created (that's api/main.py)
-#   - Scaling itself (that's Phase 3, the orchestrator)
+# What did NOT change:
+#   - Worker loop (brpop, shutdown, reconnect)
+#   - State machine (mark_processing, mark_completed, mark_failed_and_retry)
+#   - Job routing (route_job, match statement)
+#   - run_video_process() stub
 # ─────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -19,56 +18,44 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import signal
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 import httpx
 import redis.asyncio as aioredis
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
+
 
 # ── LOGGING ───────────────────────────────────────────────────
-# Structured logging — every log line has a consistent format.
-# worker_id in every line means you can filter logs per worker
-# when you have multiple workers running simultaneously.
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
-
 logger = logging.getLogger("worker")
+
 
 # ── SETTINGS ──────────────────────────────────────────────────
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
-
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_db: int = 0
     job_queue_key: str = "jobs:queue"
     job_state_prefix: str = "jobs:state:"
     worker_id: str = "worker-1"
-    brpop_timeout: int = 5          # seconds to block before checking shutdown flag
-                                    # lower = more responsive to shutdown signals
-                                    # higher = fewer Redis round trips
- 
- 
+    brpop_timeout: int = 5
+
+    class Config:
+        env_file = ".env"
+
+
 settings = Settings()
 
-# ── JOB STATE TRANSITIONS ─────────────────────────────────────
-# Every job moves through a defined set of states.
-# The worker is responsible for driving these transitions.
-# The API only ever sets QUEUED — everything after is the worker.
-#
-#   QUEUED → PROCESSING → COMPLETED
-#                      ↘ FAILED (retry_count < max_retries → back to QUEUED)
-#                      ↘ CORRUPTED (retry_count >= max_retries)
- 
+
+# ── JOB STATUS ────────────────────────────────────────────────
 class JobStatus:
     QUEUED = "queued"
     PROCESSING = "processing"
@@ -78,9 +65,6 @@ class JobStatus:
 
 
 # ── JOB RESULT ────────────────────────────────────────────────
-# A dataclass is the right tool here — this is pure data,
-# no validation needed, no HTTP serialization.
-# Pydantic would be overkill for internal worker data structures.
 @dataclass
 class JobResult:
     success: bool
@@ -89,11 +73,7 @@ class JobResult:
 
 
 # ── REDIS STATE HELPERS ───────────────────────────────────────
-# These functions are the worker's write interface to Redis.
-# Each one represents a state transition with a clear name.
-
 async def mark_processing(redis: aioredis.Redis, job: dict) -> None:
-    """Job popped from queue — worker has taken ownership."""
     job_key = f"{settings.job_state_prefix}{job['job_id']}"
     await redis.hset(job_key, mapping={
         "status": JobStatus.PROCESSING,
@@ -104,7 +84,6 @@ async def mark_processing(redis: aioredis.Redis, job: dict) -> None:
 
 
 async def mark_completed(redis: aioredis.Redis, job: dict, result: JobResult) -> None:
-    """Pipeline ran successfully — store results."""
     job_key = f"{settings.job_state_prefix}{job['job_id']}"
     await redis.hset(job_key, mapping={
         "status": JobStatus.COMPLETED,
@@ -115,30 +94,13 @@ async def mark_completed(redis: aioredis.Redis, job: dict, result: JobResult) ->
 
 
 async def mark_failed_and_retry(redis: aioredis.Redis, job: dict, error: str) -> None:
-    """
-    Pipeline failed — decide whether to retry or mark corrupted.
-    This is the retry logic from the image comment:
-    - increment retry_count
-    - if below max_retries: push back onto queue
-    - if at max_retries: mark corrupted, do not requeue
-    
-    Key insight: retry_count lives in the JOB PAYLOAD, not just
-    the state hash. When the job goes back onto the queue, it carries
-    its retry history with it. The next worker that picks it up
-    knows how many times it has already failed.
-    """
     job_key = f"{settings.job_state_prefix}{job['job_id']}"
     retry_count = job.get("retry_count", 0) + 1
     max_retries = job.get("max_retries", 2)
- 
+
     if retry_count <= max_retries:
-        # Update retry count in the job payload before requeueing
         job["retry_count"] = retry_count
- 
-        # Push back to queue — worker picks it up again later
         await redis.lpush(settings.job_queue_key, json.dumps(job))
- 
-        # Update state hash — status goes back to QUEUED
         await redis.hset(job_key, mapping={
             "status": JobStatus.QUEUED,
             "retry_count": retry_count,
@@ -150,7 +112,6 @@ async def mark_failed_and_retry(redis: aioredis.Redis, job: dict, error: str) ->
             f"(attempt {retry_count}/{max_retries}) | error: {error}"
         )
     else:
-        # Exhausted all retries — equivalent to "corrupted folder" in the image
         await redis.hset(job_key, mapping={
             "status": JobStatus.CORRUPTED,
             "retry_count": retry_count,
@@ -162,169 +123,237 @@ async def mark_failed_and_retry(redis: aioredis.Redis, job: dict, error: str) ->
             f"after {retry_count} attempts | error: {error}"
         )
 
-# ── PIPELINES ─────────────────────────────────────────────────
-# Each pipeline is an async function that receives the job config
-# and returns a JobResult. The worker doesn't care what's inside —
-# it just calls the right one based on job_type.
-# Adding a new pipeline = adding a new function + one line in route_job().
 
+# ── METRICS HELPERS ───────────────────────────────────────────
+# Pulled out of run_load_test() so each concern has a name.
+# percentile() and bucket_error() are pure functions —
+# they take data in, return a value out, no side effects.
+# Easy to test independently when we add tests in Phase 3.
+
+def percentile(latencies: list[float], p: float) -> float:
+    """
+    Compute the p-th percentile of a sorted list.
+    p=95 means: 95% of requests were faster than this value.
+
+    Why percentiles matter more than averages:
+    Average latency of 50ms sounds fine.
+    But if p99 is 4000ms, 1 in 100 users waits 4 seconds.
+    Averages hide the tail. Percentiles expose it.
+    """
+    if not latencies:
+        return 0.0
+    sorted_l = sorted(latencies)
+    # index calculation: p=95, len=100 → index 95
+    # p=95, len=10 → index 9 (last element — the worst case)
+    index = int(len(sorted_l) * (p / 100))
+    # clamp to last element so we never go out of bounds
+    index = min(index, len(sorted_l) - 1)
+    return round(sorted_l[index], 2)
+
+
+def bucket_error(exc: Exception, status_code: int | None) -> str:
+    """
+    Categorise a failure into one of four buckets.
+
+    Why bucketing matters:
+      timeout        → target is slow, probably overloaded
+      connection_error → target is unreachable or crashed
+      4xx            → client-side problem (bad URL, auth, payload)
+      5xx            → server-side problem (target is broken)
+
+    These are different diagnoses. Collapsing them into "error"
+    loses information you need to act on.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
+        return "connection_error"
+    if status_code is not None:
+        if 400 <= status_code < 500:
+            return "4xx"
+        if status_code >= 500:
+            return "5xx"
+    return "unknown"
+
+
+# ── LOAD TEST PIPELINE ────────────────────────────────────────
 async def run_load_test(config: dict) -> JobResult:
     """
-    Fires concurrent HTTP requests at target_url.
-    Uses asyncio.gather for true concurrency — all requests
-    are in flight simultaneously, not sequentially.
- 
-    This is a simplified Phase 1 version.
-    Phase 2 will add: percentile latencies, error bucketing,
-    per-worker result aggregation.
-    """
+    Phase 2 load test pipeline.
 
+    New vs Phase 1:
+      - error_breakdown dict instead of flat errors list
+      - full percentile distribution (p50, p75, p95, p99)
+      - throughput_rps — requests completed per second
+      - duration_seconds — wall clock time for the full test
+      - worker_id tagged on result for per-worker aggregation
+      - bucket_error() categorises failures meaningfully
+      - test_started_at / test_completed_at for audit trail
+    """
     target_url = config["target_url"]
     request_count = config["request_count"]
     concurrency = config["concurrency"]
     timeout = config.get("timeout_seconds", 30)
 
-    results = {
+    # ── result accumulator ────────────────────────────────────
+    # Mutable dict updated by each concurrent request.
+    # asyncio is single-threaded so no locking needed —
+    # coroutines don't truly run in parallel, they interleave
+    # at await points. No race conditions on this dict.
+    results: dict[str, Any] = {
         "target_url": target_url,
         "request_count": request_count,
         "concurrency": concurrency,
+        "worker_id": settings.worker_id,
         "success_count": 0,
         "error_count": 0,
-        "latencies_ms": [],
-        "errors": [],
+        "error_breakdown": {
+            "timeout": 0,
+            "connection_error": 0,
+            "4xx": 0,
+            "5xx": 0,
+            "unknown": 0,
+        },
+        "_latencies": [],           # prefixed with _ — internal, stripped before storing
     }
 
-    # Semaphore limits how many requests are in flight at once.
-    # Without this, request_count=1000 would launch 1000 coroutines
-    # simultaneously — overwhelming the target and your own network.
-
     semaphore = asyncio.Semaphore(concurrency)
+    test_start_wall = datetime.now(timezone.utc)          # wall clock — for timestamps
+    test_start_mono = asyncio.get_event_loop().time()     # monotonic — for duration
 
     async def fire_single_request(client: httpx.AsyncClient) -> None:
         async with semaphore:
-            start = asyncio.get_event_loop().time()
+            req_start = asyncio.get_event_loop().time()
+            status_code = None
+            exc_caught = None
+
             try:
                 response = await client.get(target_url, timeout=timeout)
-                elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
-                results["latencies_ms"].append(round(elapsed_ms, 2))
+                status_code = response.status_code
+                elapsed_ms = (asyncio.get_event_loop().time() - req_start) * 1000
+                results["_latencies"].append(round(elapsed_ms, 2))
 
                 if response.status_code < 400:
                     results["success_count"] += 1
                 else:
+                    # HTTP error response — still got a response, just a bad one
+                    exc_caught = Exception(f"HTTP {status_code}")
                     results["error_count"] += 1
-                    results["errors"].append(f"HTTP {response.status_code}")
-            except Exception as e:
-                results["error_count"] += 1
-                results["errors"].append(str(e))
+                    bucket = bucket_error(exc_caught, status_code)
+                    results["error_breakdown"][bucket] += 1
 
+            except Exception as exc:
+                elapsed_ms = (asyncio.get_event_loop().time() - req_start) * 1000
+                results["_latencies"].append(round(elapsed_ms, 2))
+                results["error_count"] += 1
+                bucket = bucket_error(exc, status_code)
+                results["error_breakdown"][bucket] += 1
+                logger.debug(f"Request failed: {type(exc).__name__}: {exc}")
+
+    # ── fire all requests ─────────────────────────────────────
     async with httpx.AsyncClient() as client:
-        tasks = [fire_single_request(client=client) for _ in range(request_count)]
+        tasks = [fire_single_request(client) for _ in range(request_count)]
         await asyncio.gather(*tasks)
 
-    # Compute summary stats
-    latencies = results["latencies_ms"]
-    if latencies:
-        results["avg_latency_ms"] = round(sum(latencies) / len(latencies), 2)
-        results["min_latency_ms"] = round(min(latencies), 2)
-        results["max_latency_ms"] = round(max(latencies), 2)
-        # p95 — sort and take the value at the 95th percentile index
-        sorted_latencies = sorted(latencies)
-        p95_index = int(len(sorted_latencies) * 0.95)
-        results["p95_latency_ms"] = sorted_latencies[p95_index]
+    # ── compute aggregates ───────────────────────────────────
+    test_end_mono = asyncio.get_event_loop().time()
+    test_end_wall = datetime.now(timezone.utc)
 
-    # Remove raw latency list from stored results — can be thousands of floats
-    results.pop("latencies_ms")
-    # Keep only unique errors, capped for readability
-    results["errors"] = list(set(results["errors"]))[:10]
+    # use monotonic times for duration to avoid wall-clock adjustments
+    duration_seconds = round(test_end_mono - test_start_mono, 3)
+    latencies = results.pop("_latencies")   # remove internal key before storing
+
+    # throughput — how many requests completed per second (guard divide-by-zero)
+    throughput_rps = round(request_count / duration_seconds, 2) if duration_seconds > 0 else 0.0
+
+    results.update({
+        "duration_seconds": duration_seconds,
+        "throughput_rps": throughput_rps,
+        "test_started_at": test_start_wall.isoformat(),   # wall clock for timestamps
+        "test_completed_at": test_end_wall.isoformat(),
+    })
+
+    if latencies:
+        results["latency"] = {
+            "avg_ms":  round(sum(latencies) / len(latencies), 2),
+            "min_ms":  round(min(latencies), 2),
+            "max_ms":  round(max(latencies), 2),
+            "p50_ms":  percentile(latencies, 50),
+            "p75_ms":  percentile(latencies, 75),
+            "p95_ms":  percentile(latencies, 95),
+            "p99_ms":  percentile(latencies, 99),
+        }
+    else:
+        results["latency"] = {}
+
+    # strip error buckets that had zero hits — cleaner output
+    results["error_breakdown"] = {
+        k: v for k, v in results["error_breakdown"].items() if v > 0
+    }
 
     logger.info(
         f"Load test complete | "
         f"success={results['success_count']} "
         f"errors={results['error_count']} "
-        f"avg_latency={results.get('avg_latency_ms')}ms"
+        f"duration={duration_seconds}s "
+        f"throughput={throughput_rps}rps "
+        f"p95={results['latency'].get('p95_ms')}ms"
     )
+
     return JobResult(success=True, data=results)
 
 
+# ── VIDEO PIPELINE (stub) ─────────────────────────────────────
 async def run_video_process(config: dict) -> JobResult:
     """
-    Phase 1 stub — video processing pipeline placeholder.
-    Real implementation (ffmpeg, HLS conversion, R2 upload)
-    comes in Phase 2 when we build the video platform.
- 
-    The worker routing works now. The pipeline itself is TODO.
-    This is intentional — you can submit video_process jobs,
-    watch them move through the queue, and verify the state
-    machine works before the pipeline exists.
+    Phase 2 stub — real ffmpeg + Cloudflare R2 pipeline comes
+    in Track 2 once Cloudflare account is set up.
     """
     source_path = config.get("source_path")
     resolutions = config.get("output_resolutions", ["1080p", "720p", "480p"])
- 
     logger.info(f"Video process stub | source={source_path} | resolutions={resolutions}")
- 
-    # Simulate processing time so you can watch state transitions
     await asyncio.sleep(2)
- 
     return JobResult(
         success=True,
         data={
             "source_path": source_path,
             "output_resolutions": resolutions,
-            "note": "Phase 1 stub — real ffmpeg pipeline comes in Phase 2",
+            "note": "Phase 2 stub — real ffmpeg pipeline comes in Track 2",
         }
     )
- 
+
 
 # ── JOB ROUTER ────────────────────────────────────────────────
-# Single dispatch point. The worker calls this and doesn't
-# need to know what pipeline does what internally.
 async def route_job(job: dict) -> JobResult:
     job_type = job.get("job_type")
-    config = job.get("config", {})
- 
     if job_type == "load_test":
-        return await run_load_test(config)
+        return await run_load_test(job.get("config", {}))
     elif job_type == "video_process":
-        return await run_video_process(config)
+        return await run_video_process(job.get("config", {}))
     else:
         return JobResult(
             success=False,
-            error=f"Unknown job_type: {job_type}"
+            error=f"Unknown job_type: {job.get('job_type')}"
         )
-        
 
-# ── MAIN WORKER LOOP ──────────────────────────────────────────
 
+# ── WORKER CLASS ──────────────────────────────────────────────
 class Worker:
-    """
-    The worker is a long-running process with one loop:
-      1. Block on Redis queue (brpop) — sleep until a job arrives
-      2. Deserialize the job
-      3. Mark it processing
-      4. Route to pipeline
-      5. Mark completed or handle failure/retry
-      6. Go back to step 1
- 
-    Shutdown is handled gracefully — the worker finishes its
-    current job before stopping. It does not drop a job mid-flight.
-    """
-
     def __init__(self):
         self.redis: aioredis.Redis | None = None
-        self._shutdown = False # flag checked between jobs
+        self._shutdown = False
 
     async def connect(self) -> None:
         self.redis = aioredis.Redis(
             host=settings.redis_host,
             port=settings.redis_port,
             db=settings.redis_db,
-            decode_responses=True
+            decode_responses=True,
         )
-
         await self.redis.ping()
         logger.info(
-           f"Worker {settings.worker_id} connected to Redis "
-            f"at {settings.redis_host}:{settings.redis_port}" 
+            f"Worker {settings.worker_id} connected to Redis "
+            f"at {settings.redis_host}:{settings.redis_port}"
         )
 
     async def disconnect(self) -> None:
@@ -332,89 +361,61 @@ class Worker:
             await self.redis.aclose()
             logger.info(f"Worker {settings.worker_id} disconnected from Redis")
 
-        
     def handle_shutdown(self, *_) -> None:
-        """
-        Called on SIGTERM or SIGINT (Ctrl+C / docker stop).
-        Sets the flag — the loop exits after the current job finishes.
-        This is graceful shutdown — no job is abandoned mid-flight.
-        """
-
         logger.info(f"Worker {settings.worker_id} received shutdown signal")
         self._shutdown = True
 
     async def process_one(self, raw: str) -> None:
-        """Deserialize and process a single job end to end."""
         try:
             job = json.loads(raw)
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to deserialise job: {e} | raw={raw[:100]}")
-            return # Malformed job, discard, do not retry
-        
-        job_id = job.get("job_id", "unknown")
-        logger.info(f"[{job_id}] Picked up | type={job.get('job_type')} | retry={job.get('retry_count', 0)}")
+            logger.error(f"Failed to deserialize job: {e} | raw={raw[:100]}")
+            return
 
-        await mark_processing(self.redis, job=job)
+        job_id = job.get("job_id", "unknown")
+        logger.info(
+            f"[{job_id}] Picked up | "
+            f"type={job.get('job_type')} | "
+            f"retry={job.get('retry_count', 0)}"
+        )
+
+        await mark_processing(self.redis, job)
 
         try:
             result = await route_job(job)
-
             if result.success:
-                await mark_completed(self.redis, job=job, result=result)
+                await mark_completed(self.redis, job, result)
             else:
                 await mark_failed_and_retry(self.redis, job, result.error or "pipeline returned failure")
-
         except Exception as e:
-            # Unexpected exception — treat as failure, apply retry logic
             logger.exception(f"[{job_id}] Unhandled exception in pipeline")
             await mark_failed_and_retry(self.redis, job, str(e))
 
-    
     async def run(self) -> None:
-        """
-        This is the main loop.
-
-        brpop is the core primitive:
-        - Blocks until a job appears in the queue
-        - Returns (queue_name, job_json) tuple
-        - timeout = brpop_timeout means it unblocks every N seconds to check
-        the _shutdown flag, then blocks again if no job
-
-        This is more efficeint than polling with a sleep loop:
-        polling -> hits Redis every N seconds regardless of queue state
-        brpop -> wakes up only when a job arrives (or timeout expires)        
-        
-        """
-
         await self.connect()
-        
-        # Register OS signal handlers for a graceful shutdown
+
         signal.signal(signal.SIGTERM, self.handle_shutdown)
         signal.signal(signal.SIGINT, self.handle_shutdown)
 
         logger.info(
-            f"Worker {settings.worker_id} started — listening on '{settings.job_queue_key}'"
+            f"Worker {settings.worker_id} started — "
+            f"listening on '{settings.job_queue_key}'"
         )
 
         while not self._shutdown:
             try:
-                # brpop returns None on timeout, tuple on job arrival
                 response = await self.redis.brpop(
                     settings.job_queue_key,
                     timeout=settings.brpop_timeout,
                 )
-
                 if response is None:
-                    # Timeout expired, no job - loop back and block again
                     continue
-
                 _queue_name, raw_job = response
-                await self.process_one(raw=raw_job)
+                await self.process_one(raw_job)
 
             except aioredis.RedisError as e:
                 logger.error(f"Redis error: {e} — retrying in 3s")
-                await asyncio.sleep(3) # back off before reconnecting
-
+                await asyncio.sleep(3)
             except Exception as e:
                 logger.exception(f"Unexpected error in worker loop: {e}")
                 await asyncio.sleep(1)
@@ -426,7 +427,4 @@ class Worker:
 # ── ENTRYPOINT ────────────────────────────────────────────────
 if __name__ == "__main__":
     worker = Worker()
-    asyncio.run(worker.run())      
-
-
-
+    asyncio.run(worker.run())

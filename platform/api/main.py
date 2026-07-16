@@ -113,6 +113,7 @@ class LoadTestConfig(BaseModel):
     @field_validator("target_url")
     @classmethod
     def must_be_http(cls, v: str) -> str:
+        v = v.strip()
         if not v.startswith(("http://", "https://")):
             raise ValueError("target_url must start with http:// or https://")
         return v
@@ -158,6 +159,7 @@ class JobStateResponse(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     error: str | None = None
+    result: dict | None = None
 
 
 # ── HELPERS ───────────────────────────────────────────────────
@@ -261,6 +263,12 @@ async def get_job_status(job_id: str):
 
     if not state:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    # before — never read result from hash
+    raw_result = state.get("result")
+    parsed_result = json.loads(raw_result) if raw_result else None
+    # ↑ result was stored as a JSON string by the worker
+    # hgetall gives everything back as plain strings
+    # so we parse it back into a dict before returning
 
     return JobStateResponse(
         job_id=state["job_id"],
@@ -272,6 +280,7 @@ async def get_job_status(job_id: str):
         started_at=state.get("started_at"),
         completed_at=state.get("completed_at"),
         error=state.get("error"),
+        result=parsed_result,
     )
 
 
