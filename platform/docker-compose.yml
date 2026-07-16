@@ -7,8 +7,6 @@
 #   3. Handles VOLUME MOUNTS — so data survives container restarts
 # ─────────────────────────────────────────────────────────────
 
-version: "3.9"
-
 services:
 
   # ── 1. REDIS ──────────────────────────────────────────────
@@ -49,6 +47,12 @@ services:
       redis:
         condition: service_healthy # wait for Redis healthcheck to pass
                                    # NOT just "started" — actually ready
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks:
       - app_network
 

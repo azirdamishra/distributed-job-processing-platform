@@ -28,4 +28,7 @@ COPY . .
 # python worker.py — just a Python script running in a loop.
 # No uvicorn, no server, no port binding.
 # The worker's entire interface is the Redis queue.
-CMD ["python", "worker.py"]
+EXPOSE 8000
+
+# Run the FastAPI app with Uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -81,6 +81,13 @@ cd distributed-platform/phase1
 docker-compose up --build
 ```
 
+For this repository layout, use the `distributed-job-processing-platform/platform` folder:
+
+```bash
+cd distributed-job-processing-platform/platform
+docker-compose up --build
+```
+
 To run multiple workers:
 
 ```bash
