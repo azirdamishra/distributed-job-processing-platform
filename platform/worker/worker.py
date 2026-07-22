@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import logging
 import signal
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from typing import Any
 import httpx
 import redis.asyncio as aioredis
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 
 
 logging.basicConfig(
@@ -39,11 +41,12 @@ class Settings(BaseSettings):
     job_queue_key: str = "jobs:queue"
     job_state_prefix: str = "jobs:state:"
     job_worker_prefix: str = "jobs:workers:"
-    worker_id: str = "worker-1"
+    worker_id: str = f"worker-{socket.gethostname()[:6]}" 
     brpop_timeout: int = 5
 
-    class Config:
-        env_file = ".env"
+    model_config = ConfigDict(          
+        env_file=".env"
+    )
 
 
 settings = Settings()

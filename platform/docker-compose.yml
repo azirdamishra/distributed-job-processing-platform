@@ -66,11 +66,6 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      # WORKER_ID is set dynamically at runtime so each replica
-      # has a unique identity in logs and Redis state hashes.
-      # Phase 3 autoscaler will inject this automatically.
-      # For now, set manually: WORKER_ID=worker-2 docker-compose up
-      - WORKER_ID=${WORKER_ID:-worker-1}
     depends_on:
       redis:
         condition: service_healthy

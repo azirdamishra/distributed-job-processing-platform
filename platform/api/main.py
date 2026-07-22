@@ -20,6 +20,7 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 
 
 # ── SETTINGS ──────────────────────────────────────────────────
@@ -32,8 +33,9 @@ class Settings(BaseSettings):
     job_worker_prefix: str = "jobs:workers:"   # must match worker.py exactly
     max_retries: int = 2
 
-    class Config:
-        env_file = ".env"
+    model_config = ConfigDict(
+        env_file=".env"
+    )
 
 
 settings = Settings()
